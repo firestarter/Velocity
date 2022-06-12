@@ -41,6 +41,8 @@ import com.velocitypowered.api.permission.Tristate;
 import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ServerConnection;
+import com.velocitypowered.api.proxy.crypto.IdentifiedKey;
+import com.velocitypowered.api.proxy.crypto.KeyIdentifiable;
 import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.proxy.player.PlayerSettings;
 import com.velocitypowered.api.proxy.player.ResourcePackInfo;
@@ -56,13 +58,14 @@ import com.velocitypowered.proxy.connection.util.ConnectionMessages;
 import com.velocitypowered.proxy.connection.util.ConnectionRequestResults.Impl;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
-import com.velocitypowered.proxy.protocol.packet.Chat;
 import com.velocitypowered.proxy.protocol.packet.ClientSettings;
 import com.velocitypowered.proxy.protocol.packet.Disconnect;
 import com.velocitypowered.proxy.protocol.packet.HeaderAndFooter;
 import com.velocitypowered.proxy.protocol.packet.KeepAlive;
 import com.velocitypowered.proxy.protocol.packet.PluginMessage;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackRequest;
+import com.velocitypowered.proxy.protocol.packet.chat.ChatBuilder;
+import com.velocitypowered.proxy.protocol.packet.chat.LegacyChat;
 import com.velocitypowered.proxy.protocol.packet.title.GenericTitlePacket;
 import com.velocitypowered.proxy.server.VelocityRegisteredServer;
 import com.velocitypowered.proxy.tablist.VelocityTabList;
@@ -88,13 +91,17 @@ import net.kyori.adventure.audience.MessageType;
 import net.kyori.adventure.bossbar.BossBar;
 import net.kyori.adventure.identity.Identity;
 import net.kyori.adventure.permission.PermissionChecker;
+import net.kyori.adventure.platform.facet.FacetPointers;
+import net.kyori.adventure.platform.facet.FacetPointers.Type;
 import net.kyori.adventure.pointer.Pointers;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.KeybindComponent;
 import net.kyori.adventure.text.TranslatableComponent;
+import net.kyori.adventure.text.flattener.ComponentFlattener;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
-import net.kyori.adventure.text.serializer.plain.PlainComponentSerializer;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import net.kyori.adventure.title.Title.Times;
 import net.kyori.adventure.title.TitlePart;
 import net.kyori.adventure.translation.GlobalTranslator;
@@ -105,11 +112,15 @@ import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.jetbrains.annotations.NotNull;
 
-public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
+public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, KeyIdentifiable {
 
   private static final int MAX_PLUGIN_CHANNELS = 1024;
-  private static final PlainComponentSerializer PASS_THRU_TRANSLATE = new PlainComponentSerializer(
-      c -> "", TranslatableComponent::key);
+  private static final PlainTextComponentSerializer PASS_THRU_TRANSLATE = PlainTextComponentSerializer.builder()
+      .flattener(ComponentFlattener.basic().toBuilder()
+          .mapper(KeybindComponent.class, c -> "")
+          .mapper(TranslatableComponent.class, TranslatableComponent::key)
+          .build())
+      .build();
   static final PermissionProvider DEFAULT_PERMISSIONS = s -> PermissionFunction.ALWAYS_UNDEFINED;
 
   private static final Logger logger = LogManager.getLogger(ConnectedPlayer.class);
@@ -144,13 +155,17 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
   private final @NotNull Pointers pointers = Player.super.pointers().toBuilder()
           .withDynamic(Identity.UUID, this::getUniqueId)
           .withDynamic(Identity.NAME, this::getUsername)
+          .withDynamic(Identity.DISPLAY_NAME, () -> Component.text(this.getUsername()))
+          .withDynamic(Identity.LOCALE, this::getEffectiveLocale)
           .withStatic(PermissionChecker.POINTER, getPermissionChecker())
+          .withStatic(FacetPointers.TYPE, Type.PLAYER)
           .build();
   private @Nullable String clientBrand;
   private @Nullable Locale effectiveLocale;
+  private @Nullable IdentifiedKey playerKey;
 
   ConnectedPlayer(VelocityServer server, GameProfile profile, MinecraftConnection connection,
-      @Nullable InetSocketAddress virtualHost, boolean onlineMode) {
+      @Nullable InetSocketAddress virtualHost, boolean onlineMode, @Nullable IdentifiedKey playerKey) {
     this.server = server;
     this.profile = profile;
     this.connection = connection;
@@ -165,6 +180,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
     } else {
       this.tabList = new VelocityTabListLegacy(this);
     }
+    this.playerKey = playerKey;
   }
 
   @Override
@@ -257,6 +273,11 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
   }
 
   @Override
+  public @NotNull Pointers pointers() {
+    return this.pointers;
+  }
+
+  @Override
   public InetSocketAddress getRemoteAddress() {
     return (InetSocketAddress) connection.getRemoteAddress();
   }
@@ -295,7 +316,9 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
   @Override
   public void sendMessage(@NonNull Identity identity, @NonNull Component message) {
     Component translated = translateMessage(message);
-    connection.write(Chat.createClientbound(identity, translated, this.getProtocolVersion()));
+
+    connection.write(ChatBuilder.builder(this.getProtocolVersion())
+            .component(translated).forIdentity(identity).toClient());
   }
 
   @Override
@@ -305,9 +328,11 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
     Preconditions.checkNotNull(type, "type");
 
     Component translated = translateMessage(message);
-    Chat packet = Chat.createClientbound(identity, translated, this.getProtocolVersion());
-    packet.setType(type == MessageType.CHAT ? Chat.CHAT_TYPE : Chat.SYSTEM_TYPE);
-    connection.write(packet);
+
+    connection.write(ChatBuilder.builder(this.getProtocolVersion())
+            .component(translated).forIdentity(identity)
+            .setType(type == MessageType.CHAT ? ChatBuilder.ChatType.CHAT : ChatBuilder.ChatType.SYSTEM)
+            .toClient());
   }
 
   @Override
@@ -328,10 +353,10 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
       JsonObject object = new JsonObject();
       object.addProperty("text", LegacyComponentSerializer.legacySection()
           .serialize(translated));
-      Chat chat = new Chat();
-      chat.setMessage(object.toString());
-      chat.setType(Chat.GAME_INFO_TYPE);
-      connection.write(chat);
+      LegacyChat legacyChat = new LegacyChat();
+      legacyChat.setMessage(object.toString());
+      legacyChat.setType(LegacyChat.GAME_INFO_TYPE);
+      connection.write(legacyChat);
     }
   }
 
@@ -466,7 +491,12 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
 
   @Override
   public ConnectionRequestBuilder createConnectionRequest(RegisteredServer server) {
-    return new ConnectionRequestBuilderImpl(server);
+    return new ConnectionRequestBuilderImpl(server, this.connectedServer);
+  }
+
+  private ConnectionRequestBuilder createConnectionRequest(RegisteredServer server,
+      @Nullable VelocityServerConnection previousConnection) {
+    return new ConnectionRequestBuilderImpl(server, previousConnection);
   }
 
   @Override
@@ -506,8 +536,10 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
   public void disconnect0(Component reason, boolean duringLogin) {
     Component translated = this.translateMessage(reason);
 
-    logger.info("{} has disconnected: {}", this,
-        LegacyComponentSerializer.legacySection().serialize(translated));
+    if (server.getConfiguration().isLogPlayerConnections()) {
+      logger.info("{} has disconnected: {}", this,
+          LegacyComponentSerializer.legacySection().serialize(translated));
+    }
     connection.closeWith(Disconnect.create(translated, this.getProtocolVersion()));
   }
 
@@ -634,7 +666,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
           connectionInFlight = null;
 
           // Make sure we clear the current connected server as the connection is invalid.
-          boolean previouslyConnected = connectedServer != null;
+          VelocityServerConnection previousConnection = connectedServer;
           if (kickedFromCurrent) {
             connectedServer = null;
           }
@@ -649,7 +681,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
             disconnect(res.getReasonComponent());
           } else if (event.getResult() instanceof RedirectPlayer) {
             RedirectPlayer res = (RedirectPlayer) event.getResult();
-            createConnectionRequest(res.getServer())
+            createConnectionRequest(res.getServer(), previousConnection)
                 .connect()
                 .whenCompleteAsync((status, throwable) -> {
                   if (throwable != null) {
@@ -692,7 +724,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
                 }, connection.eventLoop());
           } else if (event.getResult() instanceof Notify) {
             Notify res = (Notify) event.getResult();
-            if (event.kickedDuringServerConnect() && previouslyConnected) {
+            if (event.kickedDuringServerConnect() && previousConnection != null) {
               sendMessage(Identity.nil(), res.getMessageComponent());
             } else {
               disconnect(res.getMessageComponent());
@@ -830,7 +862,9 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
 
   @Override
   public String toString() {
-    return "[connected player] " + profile.getName() + " (" + getRemoteAddress() + ")";
+    boolean isPlayerAddressLoggingEnabled = server.getConfiguration().isPlayerAddressLoggingEnabled();
+    String playerIp = isPlayerAddressLoggingEnabled ? getRemoteAddress().toString() : "<ip address withheld>";
+    return "[connected player] " + profile.getName() + " (" + playerIp + ")";
   }
 
   @Override
@@ -858,10 +892,11 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
 
   @Override
   public void spoofChatInput(String input) {
-    Preconditions.checkArgument(input.length() <= Chat.MAX_SERVERBOUND_MESSAGE_LENGTH,
-        "input cannot be greater than " + Chat.MAX_SERVERBOUND_MESSAGE_LENGTH
+    Preconditions.checkArgument(input.length() <= LegacyChat.MAX_SERVERBOUND_MESSAGE_LENGTH,
+        "input cannot be greater than " + LegacyChat.MAX_SERVERBOUND_MESSAGE_LENGTH
             + " characters in length");
-    ensureBackendConnection().write(Chat.createServerbound(input));
+    ensureBackendConnection().write(ChatBuilder.builder(getProtocolVersion())
+            .asPlayer(this).message(input).toServer());
   }
 
   @Override
@@ -986,7 +1021,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
     }
 
     return queued != null
-            && queued.getOriginalOrigin() == ResourcePackInfo.Origin.DOWNSTREAM_SERVER;
+            && queued.getOriginalOrigin() != ResourcePackInfo.Origin.DOWNSTREAM_SERVER;
   }
 
   /**
@@ -1030,6 +1065,11 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
     return knownChannels;
   }
 
+  @Override
+  public IdentifiedKey getIdentifiedKey() {
+    return playerKey;
+  }
+
   private class IdentityImpl implements Identity {
     @Override
     public @NonNull UUID uuid() {
@@ -1040,9 +1080,12 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
   private class ConnectionRequestBuilderImpl implements ConnectionRequestBuilder {
 
     private final RegisteredServer toConnect;
+    private final @Nullable VelocityRegisteredServer previousServer;
 
-    ConnectionRequestBuilderImpl(RegisteredServer toConnect) {
+    ConnectionRequestBuilderImpl(RegisteredServer toConnect,
+        @Nullable VelocityServerConnection previousConnection) {
       this.toConnect = Preconditions.checkNotNull(toConnect, "info");
+      this.previousServer = previousConnection == null ? null : previousConnection.getServer();
     }
 
     @Override
@@ -1076,7 +1119,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
             }
 
             ServerPreConnectEvent event = new ServerPreConnectEvent(ConnectedPlayer.this,
-                toConnect);
+                toConnect, previousServer);
             return server.getEventManager().fire(event)
                 .thenComposeAsync(newEvent -> {
                   Optional<RegisteredServer> newDest = newEvent.getResult().getServer();
@@ -1094,7 +1137,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player {
 
                   VelocityRegisteredServer vrs = (VelocityRegisteredServer) realDestination;
                   VelocityServerConnection con = new VelocityServerConnection(vrs,
-                      ConnectedPlayer.this, server);
+                      previousServer, ConnectedPlayer.this, server);
                   connectionInFlight = con;
                   return con.connect().whenCompleteAsync(
                       (result, exception) -> this.resetIfInFlightIs(con), connection.eventLoop());
