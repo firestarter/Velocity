@@ -27,8 +27,12 @@ import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.util.ClosestLocaleMatcher;
 import java.util.List;
 import java.util.Locale;
+
+import net.kyori.adventure.audience.MessageType;
 import net.kyori.adventure.identity.Identity;
 import net.kyori.adventure.permission.PermissionChecker;
+import net.kyori.adventure.platform.facet.FacetPointers;
+import net.kyori.adventure.platform.facet.FacetPointers.Type;
 import net.kyori.adventure.pointer.Pointers;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -52,14 +56,18 @@ public final class VelocityConsole extends SimpleTerminalConsole implements Cons
   private final VelocityServer server;
   private PermissionFunction permissionFunction = ALWAYS_TRUE;
   private final @NotNull Pointers pointers = ConsoleCommandSource.super.pointers().toBuilder()
-          .withDynamic(PermissionChecker.POINTER, this::getPermissionChecker).build();
+          .withDynamic(PermissionChecker.POINTER, this::getPermissionChecker)
+          .withDynamic(Identity.LOCALE, () -> ClosestLocaleMatcher.INSTANCE
+              .lookupClosest(Locale.getDefault()))
+          .withStatic(FacetPointers.TYPE, Type.CONSOLE)
+          .build();
 
   public VelocityConsole(VelocityServer server) {
     this.server = server;
   }
 
   @Override
-  public void sendMessage(@NonNull Identity identity, @NonNull Component message) {
+  public void sendMessage(@NonNull Identity identity, @NonNull Component message, @NonNull MessageType messageType) {
     Component translated = GlobalTranslator.render(message, ClosestLocaleMatcher.INSTANCE
         .lookupClosest(Locale.getDefault()));
     logger.info(LegacyComponentSerializer.legacySection().serialize(translated));
